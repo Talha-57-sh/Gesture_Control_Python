@@ -3,7 +3,7 @@ Smart IR / Camera Gesture Controller — stable lightweight build (AI102L).
 
 Labs 5–6: ``IRGestureDashboard`` encapsulates camera, CV, automation, and exports.
 Lab 7: Pandas CSV export of gesture events.
-Lab 8: Matplotlib session dashboard (Pandas export).
+Lab 8: Pandas CSV on exit; NumPy 2D histogram + Matplotlib heatmap of hand position.
 
 Core behaviour only: fist → screenshot; index → volume up; index+middle → volume down.
 No handedness, brightness, diagnostics, or presence detection.
@@ -82,6 +82,63 @@ HAND_LINES: tuple[tuple[int, int], ...] = (
     (9, 13),
     (13, 17),
 )
+
+
+def _probe_writable_dir(path: Path) -> bool:
+    """Return True if ``path`` can be created and briefly written (handles flaky mounts)."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        test = path / ".ir_gesture_write_probe"
+        test.write_text("ok", encoding="ascii")
+        test.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _pick_writable_dir(candidates: list[Path], purpose: str) -> Path:
+    """
+    Prefer the project folder on internal disk; fall back when ``/media/...``
+    volumes raise EIO (errno 5) or are read-only.
+    """
+    for p in candidates:
+        if _probe_writable_dir(p):
+            if p.resolve() != candidates[0].resolve():
+                print(
+                    f"[Paths] Using fallback for {purpose}: {p}\n"
+                    f"        (project directory not writable or I/O error — "
+                    f"check external drive / remount)"
+                )
+            return p
+    raise RuntimeError(
+        f"No writable directory found for {purpose}. "
+        "Use internal disk or repair the filesystem."
+    )
+
+
+def _resolve_model_file(project_root: Path, fallback_dir: Path) -> Path:
+    """
+    Prefer an existing readable ``.task`` file; new downloads go to the first
+    writable location (home cache first, then project root).
+    """
+    primary = project_root / "hand_landmarker.task"
+    cached = fallback_dir / "hand_landmarker.task"
+
+    for p in (primary, cached):
+        try:
+            if p.is_file() and p.stat().st_size > 1000:
+                return p
+        except OSError:
+            continue
+
+    for target in (cached, primary):
+        if _probe_writable_dir(target.parent):
+            return target
+
+    raise RuntimeError(
+        "Cannot resolve writable path for hand_landmarker.task "
+        "(external volume may be failing — move the project to ~/ or repair the disk)."
+    )
 
 
 def _mean_bgr(bgr: Any) -> float:
@@ -335,14 +392,28 @@ class IRGestureDashboard:
 
     def __init__(self) -> None:
         self.root = Path(__file__).resolve().parents[1]
-        self.data_dir = self.root / "data"
-        self.shots_dir = self.root / "screenshots"
-        self.model_path = self.root / "hand_landmarker.task"
+        home_app = Path.home() / ".local" / "share" / "ir-gesture-dashboard"
+
+        self.data_dir = _pick_writable_dir(
+            [
+                self.root / "data",
+                home_app / "data",
+                Path.home() / ".cache" / "ir-gesture-dashboard" / "data",
+            ],
+            "data (CSV & plots)",
+        )
+        self.shots_dir = _pick_writable_dir(
+            [
+                self.root / "screenshots",
+                home_app / "screenshots",
+                Path.home() / "Pictures" / "IRGestureScreenshots",
+            ],
+            "screenshots",
+        )
+        self.model_path = _resolve_model_file(self.root, home_app)
         self.csv_path = self.data_dir / "ir_session_data.csv"
         self.plot_path = self.data_dir / "ir_session_dashboard.png"
-
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.shots_dir.mkdir(parents=True, exist_ok=True)
+        self.heatmap_path = self.data_dir / "ir_session_hand_heatmap.png"
 
         self._events: list[GestureEvent] = []
         self._stab = _FrameStabilizer()
@@ -355,11 +426,20 @@ class IRGestureDashboard:
         self._prev_t = time.perf_counter()
 
     def _ensure_model(self) -> None:
-        if self.model_path.exists():
-            return
+        try:
+            if self.model_path.is_file() and self.model_path.stat().st_size > 1000:
+                return
+        except OSError:
+            pass
         print("[..] Downloading hand_landmarker.task …")
-        urllib.request.urlretrieve(MODEL_URL, str(self.model_path))
-        print("[OK] Model ready.")
+        try:
+            urllib.request.urlretrieve(MODEL_URL, str(self.model_path))
+            print("[OK] Model ready.")
+        except OSError as exc:
+            raise RuntimeError(
+                "Could not download or save hand_landmarker.task — "
+                "check disk space and network."
+            ) from exc
 
     def _init_mp(self) -> None:
         self._ensure_model()
@@ -493,11 +573,12 @@ class IRGestureDashboard:
         )
 
     def _export(self) -> None:
-        # Lazy import: keeps the realtime loop free of pandas/matplotlib startup cost.
+        # Lazy import: keeps the realtime loop free of pandas/matplotlib/numpy startup cost.
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import numpy as np
         import pandas as pd
 
         if not self._events:
@@ -506,10 +587,30 @@ class IRGestureDashboard:
             )
         else:
             df = pd.DataFrame([e.__dict__ for e in self._events])
-        df.to_csv(self.csv_path, index=False)
-        print(f"[Data] CSV: {self.csv_path}")
+        try:
+            df.to_csv(self.csv_path, index=False)
+            print(f"[Data] CSV (Pandas): {self.csv_path}")
+        except OSError as exc:
+            print(f"[Data] CSV export failed ({exc}); session data was not saved.")
 
-        plt.figure(figsize=(11, 4.5))
+        ok = df[(df["x"] >= 0) & (df["y"] >= 0)] if not df.empty else df
+        heatmap_data = None
+        extent = None
+
+        if not ok.empty and len(ok) >= 1:
+            xs = ok["x"].to_numpy(dtype=np.float64)
+            ys = ok["y"].to_numpy(dtype=np.float64)
+            n = len(xs)
+            # 2D histogram (NumPy) — density of hand centroid in image coordinates
+            nxb = int(np.clip(8 + np.sqrt(n) * 4, 12, 72))
+            nyb = int(np.clip(8 + np.sqrt(n) * 4, 12, 56))
+            H, xedges, yedges = np.histogram2d(xs, ys, bins=[nxb, nyb])
+            # log scale for clearer heatmap when counts vary a lot
+            heatmap_data = np.log1p(H.T)
+            extent = (float(xedges[0]), float(xedges[-1]), float(yedges[0]), float(yedges[-1]))
+
+        # --- Combined dashboard: counts + heatmap --------------------------------
+        plt.figure(figsize=(12, 5))
         plt.subplot(1, 2, 1)
         if df.empty:
             plt.text(0.5, 0.5, "No events", ha="center", va="center")
@@ -519,29 +620,58 @@ class IRGestureDashboard:
             plt.title("Gesture counts")
             plt.grid(axis="y", alpha=0.3)
 
-        plt.subplot(1, 2, 2)
-        ok = df[(df["x"] >= 0) & (df["y"] >= 0)] if not df.empty else df
-        if ok.empty:
-            plt.text(0.5, 0.5, "No XY", ha="center", va="center")
+        ax_h = plt.subplot(1, 2, 2)
+        if heatmap_data is None:
+            plt.text(0.5, 0.5, "No XY samples for heatmap", ha="center", va="center")
             plt.axis("off")
         else:
-            xs = ok["x"].tolist()
-            ys = ok["y"].tolist()
-            npt = len(xs)
-            mx = sum(xs) / npt
-            my = sum(ys) / npt
-            dist = [
-                ((xi - mx) ** 2 + (yi - my) ** 2) ** 0.5 for xi, yi in zip(xs, ys)
-            ]
-            plt.scatter(xs, ys, c=dist, cmap="viridis", s=40, alpha=0.85)
-            plt.gca().invert_yaxis()
-            plt.title("Hand centroid scatter")
-            plt.grid(alpha=0.2)
+            assert extent is not None
+            im = ax_h.imshow(
+                heatmap_data,
+                origin="lower",
+                aspect="auto",
+                cmap="inferno",
+                interpolation="bilinear",
+                extent=extent,
+            )
+            ax_h.set_title("Hand location heatmap (NumPy 2D histogram)")
+            ax_h.set_xlabel("x (pixels)")
+            ax_h.set_ylabel("y (pixels)")
+            ax_h.invert_yaxis()
+            plt.colorbar(im, ax=ax_h, label="log(1 + count)")
 
         plt.tight_layout()
-        plt.savefig(self.plot_path, dpi=140)
+        try:
+            plt.savefig(self.plot_path, dpi=140)
+            print(f"[Data] Dashboard: {self.plot_path}")
+        except OSError as exc:
+            print(f"[Data] Dashboard export failed ({exc}).")
         plt.close()
-        print(f"[Data] Plot: {self.plot_path}")
+
+        # --- Standalone full-size heatmap (Lab 8 deliverable) --------------------
+        if heatmap_data is not None and extent is not None:
+            plt.figure(figsize=(8, 6))
+            ax = plt.gca()
+            im2 = ax.imshow(
+                heatmap_data,
+                origin="lower",
+                aspect="auto",
+                cmap="hot",
+                interpolation="bilinear",
+                extent=extent,
+            )
+            ax.set_title("Session heatmap — hand centroid density")
+            ax.set_xlabel("x (pixels)")
+            ax.set_ylabel("y (pixels)")
+            ax.invert_yaxis()
+            plt.colorbar(im2, ax=ax, label="log(1 + count)")
+            plt.tight_layout()
+            try:
+                plt.savefig(self.heatmap_path, dpi=160)
+                print(f"[Data] Heatmap (NumPy + Matplotlib): {self.heatmap_path}")
+            except OSError as exc:
+                print(f"[Data] Heatmap file export failed ({exc}).")
+            plt.close()
 
     def run(self) -> None:
         print("IR Gesture Dashboard — Fist | Index | Index+Middle")
